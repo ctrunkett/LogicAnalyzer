@@ -1,0 +1,401 @@
+//// Initialization steps ///
+task init_LAdig;
+    send_cmd = 0;
+    REF_CLK = 0;
+    RST_n = 0;						// assert reset
+    repeat (2) @(posedge REF_CLK);
+    @(negedge REF_CLK);				// on negedge REF_CLK after a few REF clocks
+    RST_n = 1;						// deasert reset
+    @(negedge REF_CLK);
+endtask
+
+/// send a command ///
+task send_command;
+	input [15:0] CMD_TO_SEND;
+	host_cmd = CMD_TO_SEND;	//
+    @(negedge clk);
+    send_cmd = 1;
+    @(negedge clk);
+    send_cmd = 0;
+endtask
+
+/// wait for a command to be sent and check that response is correct ///
+task wait_cmd_sent;
+	input [7:0] RESP_EXP;
+	@(posedge resp_rdy);
+	if (resp != RESP_EXP) begin
+		$display("expected resp was  %h but received %h", RESP_EXP, resp);
+		$stop();
+	end
+	clr_resp_rdy = 1;
+	@(posedge clk);
+	clr_resp_rdy = 0;
+endtask
+
+/// poll capture_done bit ///
+task poll_capture_done;
+	loop_cnt = 0;
+	while (!capture_done_bit)
+	  begin
+	    repeat(400) @(posedge clk);		// delay a while between reads
+	    loop_cnt = loop_cnt + 1;
+	    if (loop_cnt>200) begin
+	      $display("ERROR: capture done bit never set");
+	      $stop();
+	    end
+        host_cmd = {TRIG_CFG_RD,8'h00};	// read TRIG_CFG which has capture_done bit
+        @(posedge clk);
+        send_cmd = 1;
+        @(posedge clk);
+        send_cmd = 0;
+        //////////////////////////////////////
+        // Now wait for command to be sent //
+        ////////////////////////////////////
+        @(posedge cmd_sent);
+	    ////////////////////////////
+	    // Now wait for response //
+	    //////////////////////////
+	    @(posedge resp_rdy);
+	    if (resp&8'h20)				// is capture_done bits set?
+	      capture_done_bit = 1'b1;
+	    clr_resp_rdy = 1;
+	    @(posedge clk);
+	    clr_resp_rdy = 0;
+	  end
+	$display("INFO: capture_done bit is set");
+endtask
+
+task save_dump;
+	input integer FPTR;
+	@(posedge cmd_sent);
+    @(posedge clk);
+	for (sample=0; sample<384; sample++)
+      fork
+        begin: timeout1
+	      repeat(6000) @(posedge clk);
+	      $display("ERR: Only received %d of 384 bytes on dump",sample);
+		  $stop();
+	      sample = 384;		// break out of loop
+	    end
+	    begin
+	      @(posedge resp_rdy);
+	      disable timeout1;
+          $fdisplay(FPTR,"%h",resp);		// write to CH1dmp.txt
+	      clr_resp_rdy = 1;
+	      @(posedge clk);
+	      clr_resp_rdy = 0;
+	      if (sample%32==0) $display("At sample %d of dump",sample);
+	    end
+      join
+  
+  repeat(10) @(posedge clk);
+endtask
+
+task compare_dump_results;
+	input integer FPTR;
+	sample = 1;
+  mismatches = 0;
+  while (found_expected==1) begin
+    if (res!=exp)
+	  begin
+	    $display("At sample %d the result of %h does not match expected of %h",sample,res,exp);
+		mismatches = mismatches + 1;
+		if (mismatches>150) begin
+		  $display("ERR: Too many mismatches...stopping test");
+		  $stop();
+		end
+	  end
+	sample = sample + 1;
+    found_res = $fscanf(FPTR,"%h",res);
+    found_expected = $fscanf(fexp,"%h",exp);
+  end
+  $fclose(FPTR);
+  $fclose(fexp);
+endtask
+
+task poll_bad_trigger;
+	@(negedge clk);
+	strt_tx = 1;
+	@(negedge clk);
+	strt_tx = 0;
+	//when spi is done transmitting poll for capture done bit
+	@(posedge done);	// when spi has transmitted, check capture done bit
+    send_command({TRIG_CFG_RD,8'h00});
+	@(posedge resp_rdy);
+	if (resp&8'h20) begin				// check if trugger happened when it shouldnt have
+	    capture_done_bit = 1'b1;
+		$display("ERR: triggered on transmission of %h", spi_data);
+		$stop();
+	end
+	clr_resp_rdy = 1;
+	@(posedge clk);
+	clr_resp_rdy = 0;
+
+endtask
+
+task poll_good_trigger;
+	@(negedge clk);
+	strt_tx = 1;
+	@(negedge clk);
+	strt_tx = 0;
+	//when spi is done transmitting poll for capture done bit
+	@(posedge done);	// when spi has transmitted, check capture done bit
+	repeat(400) @(posedge clk);
+    send_command({TRIG_CFG_RD,8'h00});
+	@(posedge resp_rdy);
+	if (resp&8'h20) begin				// check if trugger happened when it shouldnt have
+	    capture_done_bit = 1'b1;
+		$display("trigger received");
+	end
+	else begin
+		$display("capture done bit not set after valid spi transaction");
+		$stop();
+	end
+	clr_resp_rdy = 1;
+	@(posedge clk);
+	clr_resp_rdy = 0;
+endtask
+
+////////////////////////////////////////////////
+// TEST 01
+////////////////////////////////////////////////
+task test_01;	
+	send_command({SET_CH1_TRG,8'h10});	// + edge
+    wait_cmd_sent(POS_ACK);
+    en_AFE = 1;	
+	send_command({SET_TRG_CFG,8'h13});	// set the run bit, keep protocol triggering off
+    wait_cmd_sent(POS_ACK);
+    capture_done_bit = 1'b0;			// capture_done not set yet
+  	poll_capture_done();				
+    send_command({DUMP_CH1,8'h00});			// dump CH1 results
+	save_dump(fptr1);
+	$fclose(fptr1);
+  //// Now compare CH1dmp.txt to expected results ////
+	fexp = $fopen("test1_expected.txt","r");
+	fptr1 = $fopen("CH1dmp.txt","r");
+	found_res = $fscanf(fptr1,"%h",res);
+	found_expected = $fscanf(fexp,"%h",exp);
+	$display("Starting comparison for CH1");
+	compare_dump_results(fptr1);
+endtask
+
+////////////////////////////////////////////////
+// TEST 02
+////////////////////////////////////////////////
+task test_02;
+	fptr1 = $fopen("CH1dmp.txt","w");
+	send_command({SET_VIH_PWM,8'hFA});
+	wait_cmd_sent(POS_ACK);
+	send_command({SET_VIL_PWM,8'h02});
+	wait_cmd_sent(POS_ACK);
+	send_command({SET_TRG_CFG,8'h13});
+	wait_cmd_sent(POS_ACK);
+	capture_done_bit = 1'b0;
+	poll_capture_done();
+	send_command({DUMP_CH1,8'h00});
+	save_dump(fptr1);
+	$fclose(fptr1);
+endtask
+
+////////////////////////////////////////////////
+// TEST 03
+////////////////////////////////////////////////
+task test_03;
+	send_command({DUMP_CH2,8'h00});
+	save_dump(fptr2);
+	$fclose(fptr2);
+endtask
+
+////////////////////////////////////////////////
+// TEST 04
+////////////////////////////////////////////////
+task test_04;
+	send_command({DUMP_CH3,8'h00});
+	save_dump(fptr3);
+	$fclose(fptr3);
+endtask
+
+////////////////////////////////////////////////
+// TEST 05
+////////////////////////////////////////////////
+task test_05;
+	send_command({DUMP_CH4,8'h00});
+	save_dump(fptr4);
+	$fclose(fptr4);
+endtask
+
+////////////////////////////////////////////////
+// TEST 06
+////////////////////////////////////////////////
+task test_06;
+	send_command({DUMP_CH5,8'h00});
+	save_dump(fptr5);
+	$fclose(fptr5);
+endtask
+
+////////////////////////////////////////////////
+// TEST 07
+////////////////////////////////////////////////
+task test_07;
+	fptr1 = $fopen("CH1dmp.txt","w");
+	send_command({SET_CH1_TRG,8'h10});	// + edge
+	wait_cmd_sent(POS_ACK);
+	send_command({SET_DEC,8'h06});
+	wait_cmd_sent(POS_ACK);
+	send_command({SET_TRG_CFG,8'h13});
+	wait_cmd_sent(POS_ACK);
+	capture_done_bit = 1'b0;
+	poll_capture_done();
+	
+	//run using Channel 1
+	send_command({DUMP_CH1,8'h00});
+	save_dump(fptr1);
+	$fclose(fptr1);
+endtask
+
+////////////////////////////////////////////////
+// TEST 08
+////////////////////////////////////////////////
+task test_08;
+	fptr2 = $fopen("CH2dmp.txt","w");
+	send_command({SET_CH2_TRG,8'h08});	// - edge
+	wait_cmd_sent(POS_ACK);
+	send_command({SET_TRG_CFG,8'h13});
+	wait_cmd_sent(POS_ACK);
+	capture_done_bit = 1'b0;
+	poll_capture_done();
+	
+	send_command({DUMP_CH2,8'h00});
+	save_dump(fptr2);
+	$fclose(fptr2);
+endtask
+
+////////////////////////////////////////////////
+// TEST 09
+////////////////////////////////////////////////
+task test_09;
+	fptr3 = $fopen("CH3dmp.txt","w");
+	send_command({SET_CH3_TRG,8'h08});	// - edge
+	wait_cmd_sent(POS_ACK);
+	send_command({SET_TRG_CFG,8'h13});
+	wait_cmd_sent(POS_ACK);
+	capture_done_bit = 1'b0;
+	poll_capture_done();
+	
+	send_command({DUMP_CH3,8'h00});
+	save_dump(fptr3);
+	$fclose(fptr3);
+endtask
+
+////////////////////////////////////////////////
+// TEST 10
+////////////////////////////////////////////////
+task test_10;
+	fptr4 = $fopen("CH4dmp.txt","w");
+	send_command({SET_CH4_TRG,8'h04});	// high level
+	wait_cmd_sent(POS_ACK);
+	send_command({SET_TRG_CFG,8'h13});
+	wait_cmd_sent(POS_ACK);
+	capture_done_bit = 1'b0;
+	poll_capture_done();
+	
+	send_command({DUMP_CH4,8'h00});
+	save_dump(fptr4);
+	$fclose(fptr4);
+endtask
+
+////////////////////////////////////////////////
+// TEST 11
+////////////////////////////////////////////////
+task test_11;
+	fptr5 = $fopen("CH5dmp.txt","w");
+	send_command({SET_CH5_TRG,8'h02});	// low level
+	wait_cmd_sent(POS_ACK);
+	send_command({SET_TRG_CFG,8'h13});
+	wait_cmd_sent(POS_ACK);
+	capture_done_bit = 1'b0;
+	poll_capture_done();
+	
+	send_command({DUMP_CH5,8'h00});
+	save_dump(fptr5);
+	$fclose(fptr5);
+endtask
+////////////////////////////////////////////////
+// TEST 12
+////////////////////////////////////////////////
+task test_12;
+	fptr1 = $fopen("CH1dmp.txt","w");
+	send_command({SET_CH1_TRG,8'h10});
+	wait_cmd_sent(POS_ACK);
+	send_command({WRT_TRGPOSH, 8'h01});
+	wait_cmd_sent(POS_ACK);
+	send_command({WRT_TRGPOSL, 8'h3F});
+	wait_cmd_sent(POS_ACK);
+	send_command({SET_TRG_CFG,8'h13});
+	wait_cmd_sent(POS_ACK);
+	capture_done_bit = 1'b0;
+	poll_capture_done();
+	
+	send_command({DUMP_CH1,8'h00});
+	save_dump(fptr1);
+	$fclose(fptr1);
+endtask
+////////////////////////////////////////////////
+// TEST 13
+////////////////////////////////////////////////
+task test_13;
+	send_command({SET_CH3_TRG,8'h01});
+	wait_cmd_sent(POS_ACK);
+	send_command({SET_DEC,8'h2});
+	wait_cmd_sent(POS_ACK);
+	
+	fptr3 = $fopen("CH3dmp.txt","w");
+	SPI_triggering = 1'b1;
+	spi_data = 16'h1234;
+	send_command({SET_MATCHL,8'hF1});
+	wait_cmd_sent(POS_ACK);
+	send_command({SET_MATCHH,8'hF0});
+	wait_cmd_sent(POS_ACK);
+	
+	
+	capture_done_bit = 0;
+	send_command({SET_TRG_CFG,8'h11});
+	wait_cmd_sent(POS_ACK);
+	poll_bad_trigger();
+	spi_data = 16'hF0F1;
+	poll_good_trigger();
+	send_command({DUMP_CH3,8'h00});
+	save_dump(fptr3);
+	$fclose(fptr3);
+endtask
+
+////////////////////////////////////////////////
+// TEST 14
+////////////////////////////////////////////////
+task test_14();
+	fptr3 = $fopen("CH3dmp.txt","w");
+	spi_data = 16'hABCD;
+	send_command({SET_MASKH,8'h03});
+	wait_cmd_sent(POS_ACK);
+	send_command({SET_MASKL,8'h02});
+	wait_cmd_sent(POS_ACK);
+	send_command({SET_MATCHH,8'h53});
+	wait_cmd_sent(POS_ACK);
+	send_command({SET_MATCHL,8'h43});
+	wait_cmd_sent(POS_ACK);
+	
+	capture_done_bit = 0;
+	send_command({SET_TRG_CFG,8'h11});
+	wait_cmd_sent(POS_ACK);
+	
+	poll_bad_trigger();
+	
+	spi_data = 16'hBABE;
+	poll_bad_trigger();
+	
+	spi_data = 16'h5041;
+	poll_good_trigger();
+	send_command({DUMP_CH3,8'h00});
+	save_dump(fptr3);
+	$fclose(fptr3);
+endtask
