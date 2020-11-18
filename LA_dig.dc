@@ -1,0 +1,97 @@
+########################################
+# read in the verilog files first
+########################################
+read_file -format sverilog { LA_dig.sv, RAMqueue.sv, dual_PWM.sv, pwm8.sv,\
+dig_core.sv, trigger.sv, prot_trig.sv, chnnl_trig.sv, UART_RX_prot.sv, \
+SPI_RX.sv, cmd_cfg.sv, capture.sv, UART_wrapper.sv, clk_rst_smpl.sv, \
+UART_rx.sv, UART_tx.sv, trigger_logic.sv, UART.sv, channel_sample.sv}
+########################################
+# set current design to top level
+########################################
+set current_design LA_dig
+link
+
+##########################################
+#create clock 1 ghz
+#########################################
+create_clock -name "clk400MHz" -period 1 -waveform {0 0.5} {clk400MHz}
+
+create_generated_clock -name "clk" -source [get_port clk400MHz] -divide_by 4 [get_pins iCLKRST/clk]
+
+create_generated_clock -name "smpl_clk" -source [get_port clk400MHz] -divide_by 1 [get_pins iCLKRST/smpl_clk]
+
+
+#########################################
+# dont touch clock
+#########################################
+set_dont_touch_network [find port clk400MHz]
+set_dont_touch_network [get_pins iCLKRST/clk]
+set_dont_touch_network [get_pins iCLKRST/smpl_clk]
+
+###########################################
+# set false paths
+###########################################
+set_false_path  -from [get_cell iDIG/iCMD/decimator*]
+set_false_path  -from [get_cell iCOMM/byte_h*]
+
+########################################
+# compile the design
+########################################
+compile -ungroup_all -map_effort medium
+
+set_clock_uncertainty 0.2 clk
+set_fix_hold clk400MHz
+set_fix_hold clk
+set_fix_hold smpl_clk
+
+
+#########################################
+# set input delay
+#########################################
+
+set_input_delay .25 -clock smpl_clk -clock_fall {CH*}
+set_input_delay .25 -clock clk400MHz {RST_n}
+set_input_delay .25 -clock clk400MHz {locked}
+set_input_delay .25 -clock clk {RX}
+
+#########################################
+# set drive strength
+#########################################
+set_driving_cell -lib_cell NAND2X1_RVT -library saed32rvt_tt0p85v25c [all_inputs]
+
+#########################################
+# dont buffer reset
+#########################################
+set_drive 0.1 RST_n
+
+#########################################
+# set_output delay
+#########################################
+set_output_delay -clock clk 0.5 [all_outputs]
+
+#########################################
+# set_load
+#########################################
+set_load 0.05 [all_outputs]
+
+#########################################
+# do the thing for parasitic capacitance
+#########################################
+set_wire_load_model -name 16000 -library saed32rvt_tt0p85v25c
+set_max_transition 0.15 [current_design]
+
+compile -map_effort medium
+
+########################################
+# write out the resulting synthesized netlist
+########################################
+write -format verilog LA_dig -output LA_dig.vg
+
+########################################
+# write reports
+########################################
+write_sdc LA_dig.sdc
+report_area > LA_dig_area.txt
+report_timing -delay max > max_delay.rpt
+report_timing -delay min > min_delay.rpt
+
